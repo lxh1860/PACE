@@ -33,6 +33,7 @@ pip install -r requirements.txt
 ## Quick Start
 
 ```python
+import random
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -53,8 +54,14 @@ raw_dataset = TensorDataset(raw_images, raw_labels)
 aug_dataset = TensorDataset(
     torch.tensor(aug_patches), torch.tensor(aug_labels)
 )
-raw_loader = DataLoader(raw_dataset, batch_size=50)
-aug_loader = DataLoader(aug_dataset, batch_size=50)
+raw_loader = DataLoader(raw_dataset, batch_size=50, shuffle=True)
+aug_loader = DataLoader(aug_dataset, batch_size=50, shuffle=True)
+
+# Similarity weights loader (one scalar per sample, batched the same way)
+aug_sims_loader = DataLoader(
+    TensorDataset(torch.tensor(aug_sims).unsqueeze(1)),
+    batch_size=50,
+)
 
 # ---------- 3. PGDS: Initialize Progressive Schedule ----------
 pace.init_pgds(
@@ -64,24 +71,31 @@ pace.init_pgds(
 
 # ---------- 4. Training Loop ----------
 device = torch.device("cuda:0")
+raw_batches_list = list(raw_loader)
+aug_batches_list = list(aug_loader)
+aug_sims_list = [s[0].tolist() for s in aug_sims_loader]
 
 for epoch in range(1, 351):
     stage, num_batches, use_aug = pace.get_pgds_plan(epoch)
 
     # Build training batches according to PGDS stage
     if stage == 'warmup':
-        batches = list(raw_loader) + list(aug_loader)
-        sims = [1.0] * len(raw_loader) + list(aug_sims_loader)
+        # All augmented + all raw
+        batches = raw_batches_list + aug_batches_list
+        sims = [[1.0] * len(b) for b in raw_batches_list] + aug_sims_list
     elif stage == 'decay':
+        # Randomly sample num_batches from combined pool
         combined = list(zip(
-            list(raw_loader) + list(aug_loader),
-            [1.0] * len(raw_loader) + list(aug_sims_loader)
+            raw_batches_list + aug_batches_list,
+            [[1.0] * len(b) for b in raw_batches_list] + aug_sims_list
         ))
         selected = random.sample(combined, num_batches)
         batches, sims = zip(*selected)
     else:  # finetune
-        batches = list(raw_loader)[:num_batches]
-        sims = [1.0] * num_batches
+        # Cycle through 1 raw batch per epoch
+        idx = (epoch - 1) % len(raw_batches_list)
+        batches = [raw_batches_list[idx]]
+        sims = [[1.0] * len(raw_batches_list[idx][0])]
 
     for (imgs, lbls), sim_w in zip(batches, sims):
         imgs, lbls = imgs.to(device), lbls.to(device)
@@ -100,6 +114,20 @@ for epoch in range(1, 351):
 ```
 
 ## Recommended Hyperparameters
+
+### SimFocalLoss vs Standard Cross-Entropy
+
+The `PACE.compute_loss()` uses **Sim-Adaptive Focal Loss** by default, which adaptively down-weights noisy pseudo-labeled samples via spectral confidence. If you prefer standard Cross-Entropy (e.g., for ablation studies), simply bypass the focal loss:
+
+```python
+# Standard CE (no IOC-AFM)
+loss = torch.nn.CrossEntropyLoss()(logits, targets)
+
+# Sim-Adaptive Focal Loss (full IOC-AFM)
+loss = pace.compute_loss(logits, targets, sim_weights=sim_w)
+```
+
+Gradient clipping (`pace.clip_gradients(model)`) is recommended in both cases.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|

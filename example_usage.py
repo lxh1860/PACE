@@ -92,7 +92,8 @@ def main():
     pace.init_pgds(num_aug_batches=num_aug_batches, num_raw_batches=num_raw_batches)
     print(f"\n--- PGDS Schedule ---")
     print(f"  Raw batches: {num_raw_batches}, Aug batches: {num_aug_batches}")
-    for ep in [1, 20, 35, 36, 50, 100, 200, 350]:
+    print(f"  Combined init: {num_aug_batches + num_raw_batches}")
+    for ep in [1, 20, 35, 36, 50, 100, 200, 300, 350]:
         stage, nb, use_aug = pace.get_pgds_plan(ep)
         print(f"  Epoch {ep:>3d}: stage={stage:<8s}  batches={nb}  augmented={use_aug}")
 

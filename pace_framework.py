@@ -307,6 +307,11 @@ class PACE:
     def get_pgds_plan(self, epoch):
         """Return the PGDS sampling plan for a given epoch.
 
+        Three-stage schedule (matches original implementation):
+            warmup  (epochs 1..warmup):       all augmented + raw batches
+            decay   (epochs warmup+1..T):     combined count decreases by 1/epoch
+            finetune (epochs T+1..total):     cycle through 1 raw batch/epoch
+
         Returns
         -------
         stage : str
@@ -319,13 +324,16 @@ class PACE:
         if epoch <= self.warmup_epochs:
             return 'warmup', self._combined_init, True
 
+        # Decay: combined count drops by 1 each epoch, all the way to 1
         decay_epoch = epoch - self.warmup_epochs
-        current = max(self._min_batches, self._combined_init - decay_epoch)
+        current = max(1, self._combined_init - decay_epoch)
 
-        if current > self._num_raw_batches:
+        if current > 1:
             return 'decay', current, True
         else:
-            return 'finetune', self._min_batches, False
+            # Finetune: cycle through 1 raw batch per epoch
+            # (caller should advance a pointer each epoch for cycling)
+            return 'finetune', 1, False
 
     # ----- IOC-AFM -----
     def compute_loss(self, logits, targets, sim_weights=None):
