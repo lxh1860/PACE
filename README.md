@@ -33,23 +33,16 @@ pip install -r requirements.txt
 ## Quick Start
 
 ```python
-import random
-import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from pace_framework import PACE
+from pace_framework import combine_spectral_data, train_pace
 
 # ---------- 1. SSDC-DA: Data Augmentation ----------
-pace = PACE(
-    num_classes=16, total_epochs=350, warmup_epochs=35,
+aug_patches, aug_labels, aug_sims, aug_coords = combine_spectral_data(
+    image=image, image_true=image, gt=gt, gt_train=gt_train,
+    patch_size=7, num_classes=num_classes,
     similar=0.85, spatial_radius=5,
-    sim_power=2.0, max_gamma=2.0, max_grad_norm=5.0,
-)
-
-# image: (H, W, B) HSI cube; gt_train: (H, W) labels, -1 = unlabeled
-aug_patches, aug_labels, aug_sims, aug_coords = pace.augment(
-    image=image, image_true=image,
-    gt=gt, gt_train=gt_train, patch_size=7
 )
 
 # ---------- 2. Build DataLoaders ----------
@@ -57,64 +50,34 @@ raw_loader = DataLoader(TensorDataset(raw_images, raw_labels), batch_size=50)
 aug_loader = DataLoader(TensorDataset(torch.tensor(aug_patches), torch.tensor(aug_labels)), batch_size=50)
 aug_sims_loader = DataLoader(TensorDataset(torch.tensor(aug_sims).unsqueeze(1)), batch_size=50)
 
-# Convert to batch lists (same as original train() logic)
-raw_list = [(imgs, lbls) for imgs, lbls in raw_loader]
-raw_sims = [[1.0] * len(imgs) for imgs, _ in raw_loader]
-aug_list = [(imgs, lbls) for imgs, lbls in aug_loader]
-aug_sims = [s[0].tolist() for s in aug_sims_loader]
-
-combined_list = raw_list + aug_list
-combined_sims = raw_sims + aug_sims
-
-# ---------- 3. PGDS: Initialize & Train ----------
-pace.init_pgds(num_aug_batches=len(aug_list), num_raw_batches=len(raw_list))
-up_tip = 0
-
-for epoch in range(1, 351):
-    stage, num_batches, use_aug = pace.get_pgds_plan(epoch)
-
-    if stage == 'warmup':
-        train_loader = combined_list
-        train_sims = combined_sims
-    elif stage == 'decay':
-        zipped = list(zip(combined_list, combined_sims))
-        selected = random.sample(zipped, num_batches)
-        train_loader, train_sims = zip(*selected)
-    else:  # finetune
-        start, end = up_tip, up_tip + 1
-        if end >= len(raw_list):
-            up_tip = 0
-            start = 0
-            end = 1
-        train_loader = raw_list[start:end]
-        train_sims = raw_sims[start:end]
-        up_tip = end
-
-    for batch_idx, (images, targets) in enumerate(train_loader):
-        images, targets = images.to(device).float(), targets.to(device).long()
-        sim_w = torch.tensor(train_sims[batch_idx]).float().to(device)
-
-        optimizer.zero_grad()
-        logits = model(images)
-        loss = pace.compute_loss(logits, targets, sim_weights=sim_w)
-        loss.backward()
-        pace.clip_gradients(model)
-        optimizer.step()
+# ---------- 3. PGDS: Train with progressive gradient descent ----------
+train_pace(
+    network=model,
+    optimizer=optimizer,
+    criterion=nn.CrossEntropyLoss(),
+    train_loader_raw=raw_loader,
+    val_loader=val_loader,
+    epoch=350,
+    saving_path="./checkpoints",
+    device=device,
+    smooth_loss=smooth_loss,
+    train_class_num=train_class_num,
+    num_class=num_classes,
+    train_loader_exp=aug_loader,
+    train_loader_exp_cosine_similarity=aug_sims_loader,
+    num_train=50,
+    begin_tip=35,
+    max_grad_norm=5.0,
+    scheduler=scheduler,
+)
 ```
 
-## SimFocalLoss vs Standard Cross-Entropy
+The `train_pace()` function implements the full PGDS training loop internally:
+- **Stage 1** (warmup, `e <= begin_tip`): all augmented + raw batches
+- **Stage 2** (decay, `e > begin_tip`): combined batch count decreases by 1 per epoch
+- **Stage 3** (finetune, `combined == 1`): cycle through 1 raw batch per epoch
 
-The `PACE.compute_loss()` uses **Sim-Adaptive Focal Loss** by default, which adaptively down-weights noisy pseudo-labeled samples via spectral confidence. If you prefer standard Cross-Entropy (e.g., for ablation studies), simply bypass the focal loss:
-
-```python
-# Standard CE (no IOC-AFM)
-loss = torch.nn.CrossEntropyLoss()(logits, targets)
-
-# Sim-Adaptive Focal Loss (full IOC-AFM)
-loss = pace.compute_loss(logits, targets, sim_weights=sim_w)
-```
-
-Gradient clipping (`pace.clip_gradients(model)`) is recommended in both cases.
+Gradient clipping (`max_grad_norm`) is applied every step (IOC-AFM).
 
 ## Project Structure
 

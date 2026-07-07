@@ -17,10 +17,12 @@ Dependencies: numpy, torch
 """
 
 import random
+import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 
 # =============================================================================
@@ -226,118 +228,198 @@ class SimFocalLoss(nn.Module):
 # Module 3: PGDS -- Progressive Gradient Descent Strategy
 # =============================================================================
 
-class PACE:
-    """Unified interface for the PACE training framework.
+def random_select_batches(population, select_num):
+    """Randomly sample ``select_num`` items from ``population``."""
+    actual_select = max(1, min(select_num, len(population)))
+    return random.sample(population, actual_select)
 
-    Encapsulates SSDC-DA (data augmentation), PGDS (progressive sampling),
-    and IOC-AFM (adaptive focal loss + gradient clipping).
+
+def train_pace(network, optimizer, criterion,
+               train_loader_raw, val_loader, epoch, saving_path, device,
+               smooth_loss, train_class_num, num_class,
+               train_loader_exp, train_loader_exp_cosine_similarity,
+               num_train, begin_tip, max_grad_norm,
+               scheduler=None):
+    """PGDS: Progressive Gradient Descent Strategy training loop.
+
+    Three-stage progressive schedule:
+        Stage 1 (warmup,  e <= begin_tip):    all augmented + raw batches
+        Stage 2 (decay,   e > begin_tip):     combined batch count - 1 / epoch
+        Stage 3 (finetune, combined == 1):    cycle through 1 raw batch / epoch
 
     Parameters
     ----------
-    num_classes : int
-        Number of land-cover classes.
-    total_epochs : int
-        Total number of training epochs.
-    warmup_epochs : int
-        Epochs for Stage 1 (full augmented + real data).
-    similar : float
-        Spectral similarity threshold factor for SSDC-DA.
-    spatial_radius : int
-        Neighborhood radius for SSDC-DA spatial constraint.
-    sim_power : float
-        lambda exponent for SimFocalLoss confidence.
-    max_gamma : float
-        gamma_max upper bound for SimFocalLoss.
+    network : nn.Module
+        Classification backbone.
+    optimizer : torch.optim.Optimizer
+    criterion : nn.Module
+        Standard loss (e.g. CrossEntropyLoss).
+    train_loader_raw : DataLoader
+        Original labeled training data.
+    val_loader : DataLoader
+        Validation data.
+    epoch : int
+        Total training epochs.
+    saving_path : str
+        Checkpoint directory.
+    device : torch.device
+    smooth_loss : nn.Module
+        Auxiliary smooth loss (used for proposed models).
+    train_class_num : list
+        Per-class sample counts (for CB_loss if needed).
+    num_class : int
+        Number of classes.
+    train_loader_exp : DataLoader
+        Augmented (expanded) training data from SSDC-DA.
+    train_loader_exp_cosine_similarity : DataLoader
+        Spectral similarity values for augmented data.
+    num_train : int
+        Max number of augmented batches to use.
+    begin_tip : int
+        Epoch at which PGDS decay begins.
     max_grad_norm : float
-        L2 gradient clipping threshold C.
+        Gradient clipping threshold C for IOC-AFM.
+    scheduler : optional
+        Learning rate scheduler.
     """
+    best_acc = -0.1
+    epoch_losses = []
 
-    def __init__(self, num_classes, total_epochs, warmup_epochs,
-                 similar, spatial_radius,
-                 sim_power, max_gamma, max_grad_norm):
-        self.num_classes = num_classes
-        self.total_epochs = total_epochs
-        self.warmup_epochs = warmup_epochs
-        self.similar = similar
-        self.spatial_radius = spatial_radius
-        self.max_grad_norm = max_grad_norm
+    # --- Data preparation: convert DataLoaders to batch lists ---
+    train_loader_raw_list = []
+    train_loader_raw_cosine_similarity_list = []
+    for i, (images, targets) in enumerate(train_loader_raw):
+        train_loader_raw_list.append((images, targets))
+        train_loader_raw_cosine_similarity_list.append([1.0] * len(images))
 
-        self.focal_loss = SimFocalLoss(
-            num_classes=num_classes,
-            sim_power=sim_power,
-            max_gamma=max_gamma,
-        )
-
-        self._num_aug_batches = 0
-        self._num_raw_batches = 0
-        self._min_batches = 1
-        self._combined_init = 0
-
-    # ----- SSDC-DA -----
-    def augment(self, image, image_true, gt, gt_train, patch_size):
-        """Run SSDC-DA to generate pseudo-labeled samples.
-
-        Returns
-        -------
-        aug_patches, aug_labels, aug_sims, aug_coords
-        """
-        return combine_spectral_data(
-            image, image_true, gt, gt_train, patch_size,
-            self.num_classes, self.similar, self.spatial_radius,
-        )
-
-    # ----- PGDS -----
-    def init_pgds(self, num_aug_batches, num_raw_batches):
-        """Record batch counts for PGDS scheduling.
-
-        Call once after building DataLoaders from augmented/raw data.
-
-        Parameters
-        ----------
-        num_aug_batches : int
-            Number of batches from the augmented dataset.
-        num_raw_batches : int
-            Number of batches from the original labeled dataset.
-        """
-        self._num_aug_batches = num_aug_batches
-        self._num_raw_batches = num_raw_batches
-        self._combined_init = num_aug_batches + num_raw_batches
-
-    def get_pgds_plan(self, epoch):
-        """Return the PGDS sampling plan for a given epoch.
-
-        Three-stage schedule (faithful to original train() logic):
-            warmup  (epoch <= warmup_epochs):   all augmented + raw
-            decay   (epoch > warmup, size > 1):  random sample from combined
-            finetune (size == 1):                cycle through 1 raw batch
-
-        Returns
-        -------
-        stage : str
-            One of 'warmup', 'decay', 'finetune'.
-        num_batches : int
-            How many batches to use this epoch.
-        use_augmented : bool
-            Whether augmented data participates.
-        """
-        # Mirror original: current_batch_size_combined -= 1 after warmup
-        current = self._combined_init - max(0, epoch - self.warmup_epochs)
-        current = max(self._min_batches, current)
-
-        if epoch <= self.warmup_epochs:
-            return 'warmup', self._combined_init, True
-        elif current == self._min_batches:
-            return 'finetune', self._min_batches, False
+    train_loader_exp_list = []
+    train_loader_exp_cosine_similarity_list = []
+    for i, image_cos in enumerate(train_loader_exp_cosine_similarity):
+        if i < num_train:
+            train_loader_exp_cosine_similarity_list.append(image_cos)
         else:
-            return 'decay', current, True
+            break
 
-    # ----- IOC-AFM -----
-    def compute_loss(self, logits, targets, sim_weights=None):
-        """Compute Sim-Adaptive Focal Loss."""
-        return self.focal_loss(logits, targets, sim_weights)
+    for i, (images_exp, targets_exp) in enumerate(train_loader_exp):
+        if i < num_train:
+            train_loader_exp_list.append((images_exp, targets_exp))
+        else:
+            break
 
-    def clip_gradients(self, model):
-        """Apply adaptive gradient clipping (IOC-AFM safety valve)."""
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(), max_norm=self.max_grad_norm
-        )
+    combined_list = train_loader_raw_list + train_loader_exp_list
+    combined_list_cosine_similarity = train_loader_raw_cosine_similarity_list + train_loader_exp_cosine_similarity_list
+
+    current_batch_size_raw = len(train_loader_raw_list)
+    current_batch_size_combined = len(combined_list)
+    up_tip = 0
+    max_curr = 1
+
+    # --- Initialize IOC-AFM: SimFocalLoss ---
+    criterion_focal = SimFocalLoss(
+        num_classes=num_class,
+        sim_power=2,
+        max_gamma=2,
+    ).to(device)
+
+    for e in tqdm(range(1, epoch + 1), desc="training"):
+        network.train()
+        batch_losses = []
+
+        # --- PGDS sampling logic ---
+        start = up_tip
+        end = up_tip + max_curr
+
+        if e > begin_tip:
+            current_batch_size_combined = int(current_batch_size_combined - 1)
+
+        current_batch_size = max(max_curr, current_batch_size_combined)
+
+        if current_batch_size == max_curr:
+            # Stage 3 (finetune): cycle through 1 raw batch
+            if end >= current_batch_size_raw:
+                up_tip = 0
+                train_loader = train_loader_raw_list[start:]
+                train_loader_cos = train_loader_raw_cosine_similarity_list[start:]
+            else:
+                train_loader = train_loader_raw_list[start:end]
+                train_loader_cos = train_loader_raw_cosine_similarity_list[start:end]
+            up_tip = up_tip + max_curr
+        else:
+            if e <= begin_tip:
+                # Stage 1 (warmup): use all data
+                train_loader = combined_list
+                train_loader_cos = combined_list_cosine_similarity
+            else:
+                # Stage 2 (decay): random sample from combined
+                zipped_data = list(zip(combined_list, combined_list_cosine_similarity))
+                selected_zipped = random_select_batches(zipped_data, current_batch_size)
+                train_loader, train_loader_cos = zip(*selected_zipped)
+
+        # --- Training loop ---
+        for batch_idx, (images, targets) in enumerate(train_loader):
+            images, targets = images.to(device).float(), targets.to(device).long()
+
+            optimizer.zero_grad()
+            outputs = network(images)
+
+            sim_w = torch.tensor(train_loader_cos[batch_idx]).float().to(device)
+
+            # Loss
+            loss0 = criterion(outputs, targets)
+
+            if num_class > 0 and smooth_loss is not None:
+                loss2 = smooth_loss(outputs, targets)
+                loss = loss0 + 0.5 * loss2
+            else:
+                loss = loss0
+
+            loss.backward()
+
+            # IOC-AFM: Gradient clipping
+            torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=max_grad_norm)
+
+            optimizer.step()
+            batch_losses.append(loss.item())
+
+        if scheduler is not None:
+            scheduler.step()
+
+        if batch_losses:
+            epoch_losses.append(np.mean(batch_losses))
+
+        if e % 20 == 0 or e == 1:
+            val_acc = _validation(network, val_loader, device, num_class)
+
+        is_best = val_acc >= best_acc
+        best_acc = max(val_acc, best_acc)
+        _save_checkpoint(network, is_best, saving_path, epoch=e, acc=best_acc)
+
+    return best_acc
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def _validation(network, val_loader, device, num_class):
+    """Validation accuracy."""
+    num_correct = 0.
+    total_num = 0.
+    network.eval()
+    with torch.no_grad():
+        for images, targets in val_loader:
+            images, targets = images.to(device), targets.to(device)
+            outputs = network(images)
+            _, predicted = torch.max(outputs, dim=1)
+            num_correct += (predicted == targets).sum().item()
+            total_num += len(targets)
+    return num_correct / total_num if total_num > 0 else 0.0
+
+
+def _save_checkpoint(network, is_best, saving_path, **kwargs):
+    """Save best model checkpoint."""
+    if not os.path.isdir(saving_path):
+        os.makedirs(saving_path, exist_ok=True)
+    if is_best:
+        tqdm.write("epoch = {epoch}: best validation OA = {acc:.4f}".format(**kwargs))
+        torch.save(network.state_dict(), os.path.join(saving_path, 'model_best.pth'))
