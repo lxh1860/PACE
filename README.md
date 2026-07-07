@@ -42,73 +42,58 @@ from pace_framework import PACE
 # ---------- 1. SSDC-DA: Data Augmentation ----------
 pace = PACE(num_classes=16, similar=0.85, spatial_radius=5)
 
-# image: (H, W, B) HSI cube
-# gt_train: (H, W) training labels, -1 = unlabeled
+# image: (H, W, B) HSI cube; gt_train: (H, W) labels, -1 = unlabeled
 aug_patches, aug_labels, aug_sims, aug_coords = pace.augment(
     image=image, image_true=image,
     gt=gt, gt_train=gt_train, patch_size=7
 )
 
 # ---------- 2. Build DataLoaders ----------
-raw_dataset = TensorDataset(raw_images, raw_labels)
-aug_dataset = TensorDataset(
-    torch.tensor(aug_patches), torch.tensor(aug_labels)
-)
-raw_loader = DataLoader(raw_dataset, batch_size=50, shuffle=True)
-aug_loader = DataLoader(aug_dataset, batch_size=50, shuffle=True)
+raw_loader = DataLoader(TensorDataset(raw_images, raw_labels), batch_size=50)
+aug_loader = DataLoader(TensorDataset(torch.tensor(aug_patches), torch.tensor(aug_labels)), batch_size=50)
+aug_sims_loader = DataLoader(TensorDataset(torch.tensor(aug_sims).unsqueeze(1)), batch_size=50)
 
-# Similarity weights loader (one scalar per sample, batched the same way)
-aug_sims_loader = DataLoader(
-    TensorDataset(torch.tensor(aug_sims).unsqueeze(1)),
-    batch_size=50,
-)
+# Convert to batch lists (same as original train() logic)
+raw_list = [(imgs, lbls) for imgs, lbls in raw_loader]
+raw_sims = [[1.0] * len(imgs) for imgs, _ in raw_loader]
+aug_list = [(imgs, lbls) for imgs, lbls in aug_loader]
+aug_sims = [s[0].tolist() for s in aug_sims_loader]
 
-# ---------- 3. PGDS: Initialize Progressive Schedule ----------
-pace.init_pgds(
-    num_aug_batches=len(aug_loader),
-    num_raw_batches=len(raw_loader),
-)
+combined_list = raw_list + aug_list
+combined_sims = raw_sims + aug_sims
 
-# ---------- 4. Training Loop ----------
-device = torch.device("cuda:0")
-raw_batches_list = list(raw_loader)
-aug_batches_list = list(aug_loader)
-aug_sims_list = [s[0].tolist() for s in aug_sims_loader]
+# ---------- 3. PGDS: Initialize & Train ----------
+pace.init_pgds(num_aug_batches=len(aug_list), num_raw_batches=len(raw_list))
+up_tip = 0
 
 for epoch in range(1, 351):
     stage, num_batches, use_aug = pace.get_pgds_plan(epoch)
 
-    # Build training batches according to PGDS stage
     if stage == 'warmup':
-        # All augmented + all raw
-        batches = raw_batches_list + aug_batches_list
-        sims = [[1.0] * len(b) for b in raw_batches_list] + aug_sims_list
+        train_loader = combined_list
+        train_sims = combined_sims
     elif stage == 'decay':
-        # Randomly sample num_batches from combined pool
-        combined = list(zip(
-            raw_batches_list + aug_batches_list,
-            [[1.0] * len(b) for b in raw_batches_list] + aug_sims_list
-        ))
-        selected = random.sample(combined, num_batches)
-        batches, sims = zip(*selected)
+        zipped = list(zip(combined_list, combined_sims))
+        selected = random.sample(zipped, num_batches)
+        train_loader, train_sims = zip(*selected)
     else:  # finetune
-        # Cycle through 1 raw batch per epoch
-        idx = (epoch - 1) % len(raw_batches_list)
-        batches = [raw_batches_list[idx]]
-        sims = [[1.0] * len(raw_batches_list[idx][0])]
+        start, end = up_tip, up_tip + 1
+        if end >= len(raw_list):
+            up_tip = 0
+            start = 0
+            end = 1
+        train_loader = raw_list[start:end]
+        train_sims = raw_sims[start:end]
+        up_tip = end
 
-    for (imgs, lbls), sim_w in zip(batches, sims):
-        imgs, lbls = imgs.to(device), lbls.to(device)
-        sim_w = torch.tensor(sim_w).float().to(device)
+    for batch_idx, (images, targets) in enumerate(train_loader):
+        images, targets = images.to(device).float(), targets.to(device).long()
+        sim_w = torch.tensor(train_sims[batch_idx]).float().to(device)
 
         optimizer.zero_grad()
-        logits = model(imgs)
-
-        # IOC-AFM: Sim-Adaptive Focal Loss
-        loss = pace.compute_loss(logits, lbls, sim_weights=sim_w)
+        logits = model(images)
+        loss = pace.compute_loss(logits, targets, sim_weights=sim_w)
         loss.backward()
-
-        # IOC-AFM: Gradient Clipping
         pace.clip_gradients(model)
         optimizer.step()
 ```
