@@ -9,7 +9,7 @@ A plug-and-play data-centric training framework for efficient hyperspectral imag
 ## Highlights
 
 - **Plug-and-play**: Works with any HSI classification backbone (CNN, Transformer, etc.) without structural modifications.
-- **Dual advantage**: Simultaneously improves OA (+1~5%) and reduces total training time (-20~36%).
+- **Dual advantage**: Simultaneously improves classification accuracy and reduces total training time.
 - **Physically grounded**: Leverages spatial homogeneity and spectral continuity as domain priors.
 
 ## Framework Overview
@@ -90,17 +90,6 @@ PACE/
 └── README.md
 ```
 
-## Results
-
-PACE was evaluated on 4 benchmark HSI datasets across 11 backbone architectures:
-
-| Dataset | Avg OA Improvement | Avg Time Reduction |
-|---------|-------------------:|-------------------:|
-| SA      | +1.33%             | -35.92%            |
-| PU      | +1.08%             | -21.39%            |
-| WHU-LK  | +1.91%             | -22.14%            |
-| HR-L    | +0.92%             | -21.13%            |
-
 ## Citation
 
 If you find this work useful, please cite:
@@ -117,11 +106,3 @@ If you find this work useful, please cite:
   year    = {2026}
 }
 ```
-
-## License
-
-This project is released under the [MIT License](LICENSE).
-
-## Acknowledgments
-
-This work was partially supported by the National Key R&D Program of China (Grant No. 2025YFB3910302), the National Natural Science Foundation of China (Grant No. 42394061), and the Zhejiang Province "Vanguard" and "Geese Leading" Research and Development Plan (Grant No. 2025C01073).
