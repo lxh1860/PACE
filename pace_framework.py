@@ -28,7 +28,7 @@ import torch.nn.functional as F
 # =============================================================================
 
 def combine_spectral_data(image, image_true, gt, gt_train, patch_size,
-                          num_classes, similar=0.85, spatial_radius=5):
+                          num_classes, similar, spatial_radius):
     """Generate physically consistent pseudo-labeled samples via dual constraints.
 
     Stage 1 (Spatial): For each labeled pixel, collect unlabeled neighbors
@@ -53,7 +53,6 @@ def combine_spectral_data(image, image_true, gt, gt_train, patch_size,
         Number of land-cover classes.
     similar : float
         Spectral similarity threshold factor in (0, 1].
-        Higher = stricter spectral constraint = fewer but purer samples.
     spatial_radius : int
         Neighborhood radius R for spatial constraint.
 
@@ -183,7 +182,7 @@ class SimFocalLoss(nn.Module):
         Upper bound gamma_max for the dynamic focusing parameter.
     """
 
-    def __init__(self, num_classes=10, sim_power=2.0, max_gamma=2.0):
+    def __init__(self, num_classes, sim_power, max_gamma):
         super().__init__()
         self.num_classes = num_classes
         self.sim_power = sim_power
@@ -253,9 +252,9 @@ class PACE:
         L2 gradient clipping threshold C.
     """
 
-    def __init__(self, num_classes, total_epochs=350, warmup_epochs=35,
-                 similar=0.85, spatial_radius=5,
-                 sim_power=2.0, max_gamma=2.0, max_grad_norm=5.0):
+    def __init__(self, num_classes, total_epochs, warmup_epochs,
+                 similar, spatial_radius,
+                 sim_power, max_gamma, max_grad_norm):
         self.num_classes = num_classes
         self.total_epochs = total_epochs
         self.warmup_epochs = warmup_epochs

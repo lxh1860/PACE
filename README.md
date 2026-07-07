@@ -40,7 +40,11 @@ from torch.utils.data import DataLoader, TensorDataset
 from pace_framework import PACE
 
 # ---------- 1. SSDC-DA: Data Augmentation ----------
-pace = PACE(num_classes=16, similar=0.85, spatial_radius=5)
+pace = PACE(
+    num_classes=16, total_epochs=350, warmup_epochs=35,
+    similar=0.85, spatial_radius=5,
+    sim_power=2.0, max_gamma=2.0, max_grad_norm=5.0,
+)
 
 # image: (H, W, B) HSI cube; gt_train: (H, W) labels, -1 = unlabeled
 aug_patches, aug_labels, aug_sims, aug_coords = pace.augment(
@@ -98,9 +102,7 @@ for epoch in range(1, 351):
         optimizer.step()
 ```
 
-## Recommended Hyperparameters
-
-### SimFocalLoss vs Standard Cross-Entropy
+## SimFocalLoss vs Standard Cross-Entropy
 
 The `PACE.compute_loss()` uses **Sim-Adaptive Focal Loss** by default, which adaptively down-weights noisy pseudo-labeled samples via spectral confidence. If you prefer standard Cross-Entropy (e.g., for ablation studies), simply bypass the focal loss:
 
@@ -113,15 +115,6 @@ loss = pace.compute_loss(logits, targets, sim_weights=sim_w)
 ```
 
 Gradient clipping (`pace.clip_gradients(model)`) is recommended in both cases.
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `similar` | 0.85 | Spectral threshold factor (higher = stricter) |
-| `spatial_radius` | 5 | Neighborhood radius R for SSDC-DA |
-| `warmup_epochs` | 35 | PGDS Stage 1 duration (full data) |
-| `sim_power` | 2.0 | SimFocalLoss lambda exponent |
-| `max_gamma` | 2.0 | SimFocalLoss gamma_max |
-| `max_grad_norm` | 5.0 | Gradient clipping threshold C |
 
 ## Project Structure
 

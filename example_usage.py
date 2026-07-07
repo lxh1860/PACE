@@ -55,7 +55,16 @@ def main():
     # ----------------------------------------------------------------
     # 2. SSDC-DA: Data Augmentation
     # ----------------------------------------------------------------
-    pace = PACE(num_classes=num_classes, similar=0.85, spatial_radius=5)
+    pace = PACE(
+        num_classes=num_classes,
+        total_epochs=350,
+        warmup_epochs=35,
+        similar=0.85,
+        spatial_radius=5,
+        sim_power=2.0,
+        max_gamma=2.0,
+        max_grad_norm=5.0,
+    )
     print("\n--- SSDC-DA: Augmenting data ---")
 
     aug_patches, aug_labels, aug_sims, aug_coords = pace.augment(
